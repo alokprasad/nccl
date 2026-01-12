@@ -775,6 +775,429 @@ Understanding these layers enables engineers to:
 
 ---
 
+# NCCL Usage: GPUs vs CPUs - Technical Writeup
+
+## 1. Introduction to NCCL
+
+NVIDIA Collective Communications Library (NCCL) is a high-performance communication library designed for multi-GPU and multi-node collective operations. It implements optimized primitives like AllReduce, Broadcast, AllGather, ReduceScatter, and more.
+
+**Key Design Principles:**
+- **GPU-First Design**: NCCL is primarily optimized for GPU-to-GPU communication
+- **Topology Aware**: Automatically detects NVLink, PCIe, and network topology
+- **RDMA Capable**: Supports InfiniBand and RoCE for high-bandwidth inter-node transfers
+- **Stream Integration**: Operations are asynchronous and integrate with CUDA streams
+
+---
+
+## 2. GPU Usage of NCCL (Primary Use Case)
+
+GPUs are the primary consumers of NCCL. The library provides optimal performance when data resides in GPU memory, leveraging hardware features like NVLink and GPU Direct RDMA.
+
+### GPU-Centric Architecture
+
+```mermaid
+flowchart TB
+    subgraph Node1 [Node 1]
+        App1[Application] --> NCCL1[NCCL Library]
+        NCCL1 --> GPU1[GPU Memory]
+        NCCL1 --> Proxy1[CPU Proxy Thread]
+        GPU1 -.->|GDR Path| NIC1[RDMA NIC]
+        Proxy1 -->|Non-GDR Path| NIC1
+    end
+    
+    subgraph Node2 [Node 2]
+        App2[Application] --> NCCL2[NCCL Library]
+        NCCL2 --> GPU2[GPU Memory]
+        NCCL2 --> Proxy2[CPU Proxy Thread]
+        GPU2 -.->|GDR Path| NIC2[RDMA NIC]
+        Proxy2 -->|Non-GDR Path| NIC2
+    end
+    
+    NIC1 <-->|RDMA/RoCE| NIC2
+```
+
+### How It Works
+
+**1. Direct GPU Memory Operations**
+- Application calls NCCL with GPU buffer pointers (e.g., `ncclAllReduce(d_sendbuf, d_recvbuf, ...)`)
+- NCCL launches CUDA kernels directly operating on GPU memory
+- All reduction/aggregation happens on GPU cores in parallel
+
+**2. GPU Direct RDMA (GDR) Path** *(Dotted line in diagram)*
+- When GPU and NIC share the same PCIe root complex
+- Data flows: `GPU Memory → NIC → Network → Remote NIC → Remote GPU Memory`
+- **Zero CPU involvement** in the data path
+- Requires: `nvidia-peermem` kernel module, compatible hardware
+
+**3. Non-GDR Path via CPU Proxy** *(Solid line in diagram)*
+- When GDR is unavailable or disabled
+- CPU proxy thread stages data through host memory
+- Data flows: `GPU → Host Buffer → NIC → Network → Remote NIC → Host Buffer → Remote GPU`
+- Higher latency due to extra copy
+
+### GPU Memory Registration
+
+For RDMA operations, NCCL registers GPU buffers as Memory Regions (MRs):
+
+```mermaid
+flowchart LR
+    subgraph Registration [GPU MR Registration Flow]
+        Alloc[cudaMalloc] --> NCCLUse[First NCCL Op]
+        NCCLUse --> RegMR[ncclIbRegMrDmaBuf]
+        RegMR --> Ready[Buffer Ready for RDMA]
+    end
+```
+
+| MR Type | Purpose | Size |
+|---------|---------|------|
+| GPU Send Buffer | Source data for collectives | User-defined |
+| GPU Recv Buffer | Destination for results | User-defined |
+| LL Protocol Buffer | Low-latency small messages | ~256KB |
+| FIFO Control | Coordination signaling | ~64KB |
+
+### Intra-Node vs Inter-Node Communication
+
+```mermaid
+flowchart TB
+    subgraph IntraNode [Intra-Node: Same Machine]
+        GPU_A[GPU 0] <-->|NVLink: 600GB/s| GPU_B[GPU 1]
+        GPU_A <-->|PCIe P2P: 32GB/s| GPU_C[GPU 2]
+        GPU_B <-->|Shared Memory| GPU_C
+    end
+    
+    subgraph InterNode [Inter-Node: Different Machines]
+        Node1_GPU[Node 1 GPU] -->|GDR| Node1_NIC[NIC]
+        Node1_NIC <-->|RDMA: 200Gb/s| Node2_NIC[NIC]
+        Node2_NIC -->|GDR| Node2_GPU[Node 2 GPU]
+    end
+```
+
+### GPU NCCL Code Example
+
+```c
+#include <cuda_runtime.h>
+#include <nccl.h>
+
+void gpu_allreduce_example(int rank, int nranks, ncclUniqueId id) {
+    ncclComm_t comm;
+    cudaStream_t stream;
+    float *d_sendbuf, *d_recvbuf;
+    size_t count = 1024 * 1024;  // 1M floats = 4MB
+    
+    // Set GPU device
+    cudaSetDevice(rank);
+    
+    // Allocate GPU memory - data stays on GPU
+    cudaMalloc(&d_sendbuf, count * sizeof(float));
+    cudaMalloc(&d_recvbuf, count * sizeof(float));
+    cudaStreamCreate(&stream);
+    
+    // Initialize NCCL communicator
+    ncclCommInitRank(&comm, nranks, id, rank);
+    
+    // AllReduce: GPU buffer → NCCL → GPU buffer (no CPU copy!)
+    ncclAllReduce(d_sendbuf, d_recvbuf, count,
+                  ncclFloat, ncclSum, comm, stream);
+    
+    cudaStreamSynchronize(stream);
+    
+    // Cleanup
+    ncclCommDestroy(comm);
+    cudaFree(d_sendbuf);
+    cudaFree(d_recvbuf);
+}
+```
+
+---
+
+## 3. CPU Usage of NCCL (Secondary Use Case)
+
+While NCCL is GPU-focused, it can operate on CPU (host) memory buffers. This is a secondary use case with important limitations.
+
+### Key Points
+
+- **NCCL can work with CPU buffers** (host memory allocated with `malloc` or `cudaMallocHost`)
+- **Requires memory pinning** for RDMA compatibility via `cudaHostRegister`
+- **CPU proxy threads always involved** - no GDR benefit
+- **Always passes through host memory** - no zero-copy optimization
+
+### CPU Buffer Architecture
+
+```mermaid
+flowchart LR
+    subgraph CPUPath [CPU Buffer Path]
+        CPUBuf[CPU Buffer] -->|cudaMemcpy| GPUStage[GPU Staging]
+        GPUStage --> NCCLOp[NCCL Operation]
+        NCCLOp --> GPUOut[GPU Output]
+        GPUOut -->|cudaMemcpy| CPUResult[CPU Result]
+    end
+```
+
+### CPU's Role in NCCL Operations
+
+Even when using GPU buffers, CPUs perform critical functions:
+
+```mermaid
+flowchart TB
+    subgraph CPURoles [CPU Responsibilities]
+        subgraph Init [Initialization Phase]
+            I1[Generate ncclUniqueId]
+            I2[TCP Bootstrap]
+            I3[Topology Detection]
+            I4[ncclCommInitRank]
+        end
+        
+        subgraph Runtime [Runtime Phase]
+            R1[Proxy Thread: Poll GPU FIFO]
+            R2[Post RDMA Work Requests]
+            R3[Poll Completion Queues]
+            R4[Signal GPU Completions]
+        end
+        
+        subgraph Teardown [Cleanup Phase]
+            T1[ncclCommDestroy]
+            T2[Deregister MRs]
+            T3[Free Resources]
+        end
+    end
+    
+    Init --> Runtime --> Teardown
+```
+
+### CPU Proxy Thread Detail
+
+The CPU proxy thread is essential for network operations:
+
+```mermaid
+sequenceDiagram
+    participant GPU as GPU Kernel
+    participant FIFO as GPU FIFO
+    participant Proxy as CPU Proxy Thread
+    participant NIC as RDMA NIC
+    
+    GPU->>FIFO: Write work request
+    loop Polling Loop
+        Proxy->>FIFO: Poll for requests
+        FIFO-->>Proxy: Work request found
+        Proxy->>NIC: ibv_post_send/recv
+        NIC-->>Proxy: Completion event
+        Proxy->>GPU: Signal completion
+    end
+```
+
+### CPU Host Memory Code Example
+
+```c
+#include <cuda_runtime.h>
+#include <nccl.h>
+#include <stdlib.h>
+
+void cpu_buffer_allreduce(int rank, int nranks, ncclUniqueId id) {
+    ncclComm_t comm;
+    cudaStream_t stream;
+    float *h_sendbuf, *h_recvbuf;  // Host pointers
+    float *d_sendbuf, *d_recvbuf;  // Device pointers for staging
+    size_t count = 1024 * 1024;
+    
+    cudaSetDevice(rank);
+    
+    // Allocate HOST memory
+    h_sendbuf = (float*)malloc(count * sizeof(float));
+    h_recvbuf = (float*)malloc(count * sizeof(float));
+    
+    // Allocate GPU staging buffers
+    cudaMalloc(&d_sendbuf, count * sizeof(float));
+    cudaMalloc(&d_recvbuf, count * sizeof(float));
+    cudaStreamCreate(&stream);
+    
+    // Initialize data on CPU
+    for (size_t i = 0; i < count; i++) {
+        h_sendbuf[i] = (float)(rank + 1);
+    }
+    
+    // Initialize NCCL
+    ncclCommInitRank(&comm, nranks, id, rank);
+    
+    // Copy CPU → GPU (extra step required!)
+    cudaMemcpy(d_sendbuf, h_sendbuf, count * sizeof(float),
+               cudaMemcpyHostToDevice);
+    
+    // NCCL operates on GPU buffers
+    ncclAllReduce(d_sendbuf, d_recvbuf, count,
+                  ncclFloat, ncclSum, comm, stream);
+    
+    cudaStreamSynchronize(stream);
+    
+    // Copy GPU → CPU (extra step required!)
+    cudaMemcpy(h_recvbuf, d_recvbuf, count * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    
+    // Results now in h_recvbuf
+    
+    // Cleanup
+    ncclCommDestroy(comm);
+    cudaFree(d_sendbuf);
+    cudaFree(d_recvbuf);
+    free(h_sendbuf);
+    free(h_recvbuf);
+}
+```
+
+---
+
+## 4. Data Flow Comparison
+
+### Side-by-Side Comparison
+
+```mermaid
+flowchart TB
+    subgraph GPUMode [GPU Mode - Optimal]
+        G1[GPU Buffer] -->|Direct| NCCL_G[NCCL]
+        NCCL_G -->|GDR or Proxy| NET_G[Network]
+    end
+    
+    subgraph CPUMode [CPU Mode - Suboptimal]
+        C1[CPU Buffer] -->|Copy to GPU| G2[GPU Staging]
+        G2 --> NCCL_C[NCCL]
+        NCCL_C --> Proxy[CPU Proxy]
+        Proxy --> NET_C[Network]
+    end
+```
+
+### Detailed Data Path Comparison
+
+```mermaid
+flowchart LR
+    subgraph GPU_Optimal [GPU Path with GDR]
+        GO1[GPU Mem] -->|1| GO2[NCCL Kernel]
+        GO2 -->|2 DMA| GO3[NIC]
+        GO3 -->|3| GO4[Wire]
+        GO4 -->|4| GO5[Remote NIC]
+        GO5 -->|5 DMA| GO6[Remote GPU]
+    end
+    
+    subgraph GPU_NoGDR [GPU Path without GDR]
+        GN1[GPU Mem] -->|1| GN2[NCCL Kernel]
+        GN2 -->|2 Copy| GN3[Host Buffer]
+        GN3 -->|3| GN4[NIC]
+        GN4 -->|4| GN5[Wire]
+        GN5 -->|5| GN6[Remote Host]
+        GN6 -->|6 Copy| GN7[Remote GPU]
+    end
+    
+    subgraph CPU_Path [CPU Buffer Path]
+        CP1[CPU Mem] -->|1 cudaMemcpy| CP2[GPU Staging]
+        CP2 -->|2| CP3[NCCL Kernel]
+        CP3 -->|3 Copy| CP4[Host Buffer]
+        CP4 -->|4| CP5[NIC]
+        CP5 -->|5| CP6[Wire]
+        CP6 -->|6| CP7[Remote Host]
+        CP7 -->|7 Copy| CP8[Remote GPU]
+        CP8 -->|8 cudaMemcpy| CP9[Remote CPU]
+    end
+```
+
+---
+
+## 5. Performance Implications
+
+### Latency Comparison
+
+| Path | Steps | Typical Latency | Notes |
+|------|-------|-----------------|-------|
+| GPU + GDR | 5 | ~1-2 μs | Optimal path, zero CPU involvement |
+| GPU + No GDR | 7 | ~5-10 μs | CPU proxy adds overhead |
+| CPU Buffer | 9 | ~15-30 μs | Extra cudaMemcpy on each side |
+
+### Bandwidth Utilization
+
+| Configuration | Achievable BW | Bottleneck |
+|---------------|---------------|------------|
+| NVLink (intra-node) | 600 GB/s | GPU memory |
+| PCIe P2P | 32 GB/s | PCIe lanes |
+| RDMA + GDR | 25 GB/s (200Gbps) | Network |
+| RDMA + Host staging | 15-20 GB/s | Host memory copy |
+| CPU buffers | 10-15 GB/s | Double cudaMemcpy |
+
+### When to Use Each Approach
+
+```mermaid
+flowchart TD
+    Start[Need Collective?] --> Q1{Where is data?}
+    
+    Q1 -->|GPU Memory| Optimal[Use GPU NCCL<br/>Best Performance]
+    Q1 -->|CPU Memory| Q2{Will data be<br/>used on GPU?}
+    
+    Q2 -->|Yes| Copy[Copy to GPU first<br/>then GPU NCCL]
+    Q2 -->|No| Q3{Performance<br/>critical?}
+    
+    Q3 -->|Yes| Consider[Consider keeping<br/>data on GPU]
+    Q3 -->|No| MPI[Use MPI or<br/>CPU library]
+```
+
+**Recommendations:**
+
+| Scenario | Recommendation |
+|----------|----------------|
+| Deep learning training | Keep tensors on GPU, use GPU NCCL |
+| Inference with batching | GPU NCCL for large batches |
+| Small control messages | CPU path acceptable |
+| CPU-bound preprocessing | Use MPI for CPU collectives |
+| Mixed GPU/CPU workload | Minimize data movement |
+
+---
+
+## 6. Code Examples Reference
+
+### Existing GPU NCCL Example
+
+The `nccl_allreduce.c` in this directory demonstrates GPU-based NCCL usage with:
+
+```c
+// From nccl_allreduce.c - GPU buffer allocation
+cudaMalloc((void**)&d_sendbuf, DATA_SIZE);  // GPU memory
+cudaMalloc((void**)&d_recvbuf, DATA_SIZE);  // GPU memory
+
+// Direct GPU-to-GPU AllReduce
+ncclAllReduce(d_sendbuf, d_recvbuf, NUM_ELEMENTS, 
+              ncclFloat, ncclSum, comm, stream);
+```
+
+### Environment Variables for Tuning
+
+| Variable | GPU Usage | CPU Usage |
+|----------|-----------|-----------|
+| `NCCL_NET_GDR_LEVEL=5` | Enable GDR | No effect |
+| `NCCL_IB_DISABLE=0` | Enable RDMA | Enable RDMA |
+| `NCCL_MIN_NCHANNELS=1` | Reduce QPs | Reduce QPs |
+| `NCCL_BUFFSIZE` | Tune buffers | Tune buffers |
+
+---
+
+## Summary
+
+| Aspect | GPU Usage | CPU Usage |
+|--------|-----------|-----------|
+| **Primary Design** | Yes - Optimized | Secondary |
+| **Data Path** | GPU → (GDR) → NIC → GPU | CPU → GPU → NIC → GPU → CPU |
+| **Zero Copy** | With GDR | Never |
+| **Latency** | Low (1-10 μs) | Higher (15-30 μs) |
+| **Bandwidth** | Up to 600 GB/s | Limited by copies |
+| **CPU Involvement** | Minimal (proxy only) | Heavy (data copies) |
+| **Best For** | Training, large transfers | Small control data |
+
+**Key Takeaway**: NCCL is designed for GPU-resident data. Keep your tensors on GPUs to maximize performance. Use CPU buffers only when data must originate/terminate on the host.
+
+---
+
+## References
+
+- [NVIDIA NCCL Documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/)
+- [NCCL Source Code](https://github.com/NVIDIA/nccl)
+- [GPU Direct RDMA](https://docs.nvidia.com/cuda/gpudirect-rdma/)
+- Local example: `nccl_allreduce.c` in this directory
+
+
 ## 8. References
 
 [1] NVIDIA Corporation. "NCCL Documentation." https://docs.nvidia.com/deeplearning/nccl/
